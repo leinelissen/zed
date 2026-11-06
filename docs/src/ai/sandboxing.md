@@ -58,7 +58,7 @@ By default, sandboxed Zed Agent tool actions have these restrictions:
 
 | Access type         | Default behavior                                                                                                                                                                       |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Filesystem reads    | Terminal commands can read most of the filesystem, including protected Git metadata.                                                                                                   |
+| Filesystem reads    | Terminal commands can read most of the filesystem, including protected Git metadata, but not files matched by `private_files`.                                                        |
 | Project writes      | Terminal commands can write inside open project directories, except for protected Git metadata.                                                                                        |
 | Git metadata        | `.git` directories and linked worktree Git metadata remain readable but are not writable while sandboxed.                                                                              |
 | Temporary files     | Terminal commands receive a writable temporary location. The exact behavior differs by platform.                                                                                       |
@@ -194,7 +194,7 @@ On macOS, Zed uses Apple's Seatbelt sandbox through `sandbox-exec`.
 
 Sandboxed terminal commands:
 
-- can read the filesystem
+- can read the filesystem, except files matched by `private_files`
 - can write inside open project directories, except protected Git metadata
 - can write to a per-thread temporary directory exposed through `$TMPDIR`, `$TMP`, and `$TEMP`
 - can read protected Git metadata
@@ -218,7 +218,7 @@ install a non-setuid Bubblewrap to enable sandboxing.
 
 Sandboxed terminal commands:
 
-- can read the filesystem, including protected Git metadata contents
+- can read the filesystem, including protected Git metadata contents, but not files matched by `private_files`
 - can write inside open project directories, except protected Git metadata
 - can write to `/tmp`, which is backed by a fresh temporary filesystem and is cleared between terminal tool calls (when you approve unrestricted filesystem writes, `/tmp` is instead your real host `/tmp` rather than a fresh temporary filesystem)
 - cannot write protected Git metadata
@@ -306,6 +306,7 @@ When running inside WSL, the Linux sandboxing behavior applies, including the re
 
 - filesystem isolation is provided by Bubblewrap
 - protected Git metadata contents remain readable, but writes are blocked
+- files matched by `private_files` cannot be read
 - `/tmp` is temporary for sandboxed terminal calls
 - network access is all-or-nothing rather than host-specific, so host-specific network requests are rejected and the agent must request unrestricted network access when network access is needed
 

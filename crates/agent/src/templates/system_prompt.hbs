@@ -159,7 +159,7 @@ The current project contains the following root directories:
 
 The `terminal` tool runs commands inside a sandbox with these permissions:
 
-- Reads: any path on the filesystem is readable, including Git metadata.
+- Reads: any path on the filesystem is readable, including Git metadata, except files marked private via `private_files`. To read one, request `unsandboxed: true`.
 {{#if is_linux}}
 - Writes: `/tmp` is writable but is cleared between `terminal` calls{{#if worktrees}}. These project directories are also writable and persist across calls:
 {{#each worktrees}}

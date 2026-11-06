@@ -223,6 +223,7 @@ fn probe_bwrap(bwrap: &Path, bwrap_args: &[String]) -> bool {
 pub fn build_bwrap_args(
     writable_directories: &[&Path],
     protected_paths: &[&Path],
+    non_readable_paths: &[&Path],
     permissions: SandboxPermissions,
     cwd: Option<&Path>,
     proxy_socket_path: Option<&Path>,
@@ -233,6 +234,7 @@ pub fn build_bwrap_args(
     build_bwrap_args_with_sandbox_paths(
         writable_directories,
         protected_paths,
+        non_readable_paths,
         permissions,
         cwd,
         proxy_socket_path,
@@ -249,6 +251,7 @@ pub fn build_bwrap_args(
 fn build_bwrap_args_with_sandbox_paths(
     writable_directories: &[&Path],
     protected_paths: &[&Path],
+    non_readable_paths: &[&Path],
     permissions: SandboxPermissions,
     cwd: Option<&Path>,
     proxy_socket_path: Option<&Path>,
@@ -304,6 +307,25 @@ fn build_bwrap_args_with_sandbox_paths(
         }
         let path = protected_path.to_string_lossy().into_owned();
         push_bind(&mut args, "--ro-bind", &path, &path);
+    }
+
+    // Hide the contents of non_readable paths by overlaying them *after* the
+    // writable and protected binds (order matters: later mounts win). bwrap has
+    // no deny-read primitive, so a directory is replaced with an empty tmpfs and
+    // a file with `/dev/null`; the path itself stays visible, matching the
+    // "content only" intent. A not-yet-existing path can't be overlaid, so it's
+    // skipped.
+    for non_readable_path in non_readable_paths {
+        if !non_readable_path.exists() {
+            continue;
+        }
+        let path = non_readable_path.to_string_lossy().into_owned();
+        if non_readable_path.is_dir() {
+            args.push("--tmpfs".to_string());
+            args.push(path);
+        } else {
+            push_bind(&mut args, "--ro-bind", "/dev/null", &path);
+        }
     }
 
     for flag in [
@@ -550,7 +572,7 @@ fn prepare_sandbox(
     // directory. None of those affect createability, and binding them would make
     // the probe depend on per-command layout (e.g. a worktree under the `/tmp`
     // tmpfs that `--chdir` then can't reach).
-    let bwrap_args = build_bwrap_args(&[], &[], permissions, None, None);
+    let bwrap_args = build_bwrap_args(&[], &[], &[], permissions, None, None);
     if !probe_bwrap(&bwrap, &bwrap_args) {
         return Err(LauncherStatus::SandboxProbeFailed);
     }
@@ -592,6 +614,7 @@ pub fn wrap_invocation(
     permissions: SandboxPermissions,
     writable_dirs: &[&Path],
     protected_paths: &[&Path],
+    non_readable_paths: &[&Path],
     cwd: Option<&Path>,
     program: &str,
     args: &[String],
@@ -638,6 +661,7 @@ pub fn wrap_invocation(
     let mut bwrap_args = build_bwrap_args_with_sandbox_paths(
         writable_dirs,
         protected_paths,
+        non_readable_paths,
         permissions,
         cwd,
         proxy_socket_path,
@@ -1519,6 +1543,7 @@ mod tests {
         let args = build_bwrap_args(
             &[missing.as_path()],
             &[],
+            &[],
             SandboxPermissions::default(),
             None,
             None,
@@ -1542,6 +1567,7 @@ mod tests {
         let args = build_bwrap_args(
             &[writable.path()],
             &[],
+            &[],
             SandboxPermissions::default(),
             Some(writable.path()),
             None,
@@ -1562,10 +1588,11 @@ mod tests {
 
     #[test]
     fn test_build_bwrap_args_network_namespace_follows_permission() {
-        let denied = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, None);
+        let denied = build_bwrap_args(&[], &[], &[], SandboxPermissions::default(), None, None);
         assert!(denied.iter().any(|arg| arg == "--unshare-net"));
 
         let allowed = build_bwrap_args(
+            &[],
             &[],
             &[],
             SandboxPermissions {
@@ -1579,6 +1606,7 @@ mod tests {
 
         let socket = PathBuf::from("/tmp/zed-proxy.sock");
         let restricted = build_bwrap_args(
+            &[],
             &[],
             &[],
             SandboxPermissions {
@@ -1601,11 +1629,46 @@ mod tests {
             allow_fs_write: true,
         };
         let protected = Path::new("/tmp");
-        let args = build_bwrap_args(&[], &[protected], permissions, None, None);
+        let args = build_bwrap_args(&[], &[protected], &[], permissions, None, None);
         assert!(windows_contains(&args, &["--bind", "/", "/"]));
         assert!(!windows_contains(&args, &["--ro-bind", "/", "/"]));
         assert!(windows_contains(&args, &["--ro-bind", "/tmp", "/tmp"]));
         assert!(!windows_contains(&args, &["--tmpfs", "/tmp"]));
+    }
+
+    #[test]
+    fn test_build_bwrap_args_overlays_non_readable_paths_after_writable_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let non_readable_file = dir.path().join("secret.env");
+        std::fs::write(&non_readable_file, "SECRET=1\n").unwrap();
+        let non_readable_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&non_readable_dir).unwrap();
+
+        let args = build_bwrap_args(
+            &[dir.path()],
+            &[],
+            &[non_readable_file.as_path(), non_readable_dir.as_path()],
+            SandboxPermissions::default(),
+            None,
+            None,
+        );
+
+        let file_str = non_readable_file.to_string_lossy().into_owned();
+        let dir_str = non_readable_dir.to_string_lossy().into_owned();
+        assert!(windows_contains(&args, &["--ro-bind", "/dev/null", &file_str]));
+        assert!(windows_contains(&args, &["--tmpfs", &dir_str]));
+
+        // The overlay must come after the writable bind so it wins.
+        let writable_str = dir.path().to_string_lossy().into_owned();
+        let writable_bind = args
+            .windows(3)
+            .position(|window| window[0] == "--bind" && window[1] == writable_str)
+            .expect("writable bind present");
+        let non_readable_overlay = args
+            .windows(3)
+            .position(|window| window[0] == "--ro-bind" && window[1] == "/dev/null")
+            .expect("non_readable overlay present");
+        assert!(non_readable_overlay > writable_bind);
     }
 
     #[test]
@@ -1776,6 +1839,7 @@ mod tests {
             NetworkAccess::None | NetworkAccess::All => None,
         };
         let mut bwrap_args = build_bwrap_args_with_sandbox_paths(
+            &[],
             &[],
             &[],
             permissions,
@@ -1958,6 +2022,7 @@ mod tests {
                 allow_fs_write: false,
             },
             &[unbindable.as_path()],
+            &[],
             &[],
             None,
             "/bin/true",

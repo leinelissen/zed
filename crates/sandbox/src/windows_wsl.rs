@@ -461,6 +461,7 @@ pub async fn wrap_invocation<S: std::hash::BuildHasher>(
     args: Vec<String>,
     writable_paths: Vec<WritablePath>,
     protected_paths: Vec<PathBuf>,
+    non_readable_paths: Vec<(PathBuf, bool)>,
     permissions: SandboxPermissions,
     cwd: Option<PathBuf>,
     env: HashMap<String, String, S>,
@@ -513,12 +514,22 @@ pub async fn wrap_invocation<S: std::hash::BuildHasher>(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let non_readable_mappings = non_readable_paths
+        .iter()
+        .map(|(path, _)| {
+            path_to_wsl_allowing_missing(path).with_context(|| {
+                format!("failed to map non_readable path `{}` into WSL", path.display())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let non_readable_is_dir: Vec<bool> = non_readable_paths.iter().map(|(_, is_dir)| *is_dir).collect();
 
     let distro = select_distro(
         cwd_mapping.as_ref(),
         writable_requested_mappings
             .iter()
             .chain(writable_mappings.iter())
+            .chain(non_readable_mappings.iter())
             .chain(protected_mappings.iter()),
     )?;
     let wsl_exe = wsl_exe_path();
@@ -536,7 +547,9 @@ pub async fn wrap_invocation<S: std::hash::BuildHasher>(
     // as with Linux bwrap, a not-yet-created path can't be overlaid.
     let has_cwd = cwd_mapping.is_some();
     let writable_path_count = writable_mappings.len();
-    let mut mappings = Vec::with_capacity(writable_mappings.len() + protected_mappings.len() + 1);
+    let mut mappings = Vec::with_capacity(
+        writable_mappings.len() + non_readable_mappings.len() + protected_mappings.len() + 1,
+    );
     if let Some(mapping) = cwd_mapping {
         mappings.push((mapping, "terminal cwd", true));
     }
@@ -546,13 +559,18 @@ pub async fn wrap_invocation<S: std::hash::BuildHasher>(
             .map(|mapping| (mapping, "writable path", true)),
     );
     mappings.extend(
+        non_readable_mappings
+            .into_iter()
+            .map(|mapping| (mapping, "non_readable path", false)),
+    );
+    mappings.extend(
         protected_mappings
             .into_iter()
             .map(|mapping| (mapping, "protected path", false)),
     );
     let resolved = resolve_paths(&wsl_exe, distro.as_deref(), &mappings).await?;
-    let (cwd, writable_paths, protected_paths) =
-        split_resolved_paths(has_cwd, writable_path_count, resolved)?;
+    let (cwd, writable_paths, protected_paths, non_readable_paths) =
+        split_resolved_paths(has_cwd, writable_path_count, &non_readable_is_dir, resolved)?;
 
     let mut wsl_args = Vec::new();
     if let Some(distro) = distro.as_deref() {
@@ -568,6 +586,7 @@ pub async fn wrap_invocation<S: std::hash::BuildHasher>(
     let bwrap_options = build_bwrap_args(
         &writable_paths,
         &protected_paths,
+        &non_readable_paths,
         permissions,
         cwd.as_deref(),
         environment.mask_interop_dir,
@@ -647,8 +666,9 @@ fn parse_canonical_grant_output(stdout: &str) -> Result<ResolvedGrant> {
 fn split_resolved_paths(
     has_cwd: bool,
     writable_path_count: usize,
+    non_readable_is_dir: &[bool],
     resolved: Vec<Option<String>>,
-) -> Result<(Option<String>, Vec<String>, Vec<String>)> {
+) -> Result<(Option<String>, Vec<String>, Vec<String>, Vec<(String, bool)>)> {
     let mut resolved = resolved.into_iter();
     let cwd = if has_cwd {
         Some(
@@ -671,7 +691,22 @@ fn split_resolved_paths(
         );
     }
 
-    Ok((cwd, writable_paths, resolved.flatten().collect()))
+    let mut non_readable_paths = Vec::with_capacity(non_readable_is_dir.len());
+    for is_dir in non_readable_is_dir {
+        if let Some(path) = resolved
+            .next()
+            .context("bug: missing resolved non_readable path")?
+        {
+            non_readable_paths.push((path, *is_dir));
+        }
+    }
+
+    Ok((
+        cwd,
+        writable_paths,
+        resolved.flatten().collect(),
+        non_readable_paths,
+    ))
 }
 
 fn select_distro<'a>(
@@ -1248,6 +1283,7 @@ fn wsl_exe_path() -> PathBuf {
 fn build_bwrap_args<S: std::hash::BuildHasher>(
     writable_paths: &[String],
     protected_paths: &[String],
+    non_readable_paths: &[(String, bool)],
     permissions: SandboxPermissions,
     cwd: Option<&str>,
     mask_interop_dir: bool,
@@ -1269,6 +1305,16 @@ fn build_bwrap_args<S: std::hash::BuildHasher>(
     // binds above (order matters: later binds win).
     for path in protected_paths {
         push_bind(&mut args, "--ro-bind", path, path);
+    }
+
+    // Hide the contents of non_readable paths by overlaying them after the
+    // writable and protected binds (order matters: later mounts win).
+    for (path, is_dir) in non_readable_paths {
+        if *is_dir {
+            args.extend(["--tmpfs".to_string(), path.clone()]);
+        } else {
+            push_bind(&mut args, "--ro-bind", "/dev/null", path);
+        }
     }
 
     // Block WSL's Windows interop, regardless of the requested permissions.
@@ -1538,6 +1584,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             SandboxPermissions::default(),
             None,
             HashMap::<String, String>::new(),
@@ -1711,9 +1758,10 @@ mod tests {
 
     #[test]
     fn split_resolved_paths_keeps_existing_protected_paths_and_skips_missing_ones() {
-        let (cwd, writable_paths, protected_paths) = split_resolved_paths(
+        let (cwd, writable_paths, protected_paths, non_readable_paths) = split_resolved_paths(
             true,
             1,
+            &[],
             vec![
                 Some("/home/me/project".to_string()),
                 Some("/home/me/project".to_string()),
@@ -1726,11 +1774,12 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/home/me/project"));
         assert_eq!(writable_paths, vec!["/home/me/project".to_string()]);
         assert_eq!(protected_paths, vec!["/mnt/c/external/.git".to_string()]);
+        assert!(non_readable_paths.is_empty());
     }
 
     #[test]
     fn split_resolved_paths_rejects_missing_required_writable_paths() {
-        let error = split_resolved_paths(false, 1, vec![None]).unwrap_err();
+        let error = split_resolved_paths(false, 1, &[], vec![None]).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1743,6 +1792,7 @@ mod tests {
     fn bwrap_denies_network_by_default() {
         let args = build_bwrap_args(
             &["/home/me/project".to_string()],
+            &[],
             &[],
             SandboxPermissions::default(),
             Some("/home/me/project"),
@@ -1761,6 +1811,7 @@ mod tests {
         let args = build_bwrap_args(
             &[],
             &[],
+            &[],
             SandboxPermissions {
                 allow_network: true,
                 allow_fs_write: false,
@@ -1776,6 +1827,7 @@ mod tests {
     fn bwrap_binds_explicit_writable_file_paths() {
         let args = build_bwrap_args(
             &["/mnt/c/Users/me/AppData/Roaming/Zed/AGENTS.md".to_string()],
+            &[],
             &[],
             SandboxPermissions::default(),
             None,
@@ -1795,6 +1847,7 @@ mod tests {
         let args = build_bwrap_args(
             &["/home/me/project".to_string()],
             &["/home/me/project/.git".to_string()],
+            &[],
             SandboxPermissions::default(),
             Some("/home/me/project"),
             true,
@@ -1823,6 +1876,7 @@ mod tests {
         let args = build_bwrap_args(
             &[],
             &["/home/me/project/.git".to_string()],
+            &[],
             SandboxPermissions {
                 allow_network: false,
                 allow_fs_write: true,
@@ -1850,9 +1904,40 @@ mod tests {
     }
 
     #[test]
+    fn bwrap_overlays_non_readable_paths_after_writable_paths() {
+        let args = build_bwrap_args(
+            &["/home/me/project".to_string()],
+            &[],
+            &[
+                ("/home/me/project/.env".to_string(), false),
+                ("/home/me/project/secrets".to_string(), true),
+            ],
+            SandboxPermissions::default(),
+            Some("/home/me/project"),
+            true,
+            &HashMap::new(),
+        );
+        let writable_index = args
+            .windows(3)
+            .position(|window| window == ["--bind", "/home/me/project", "/home/me/project"])
+            .expect("project should be writable");
+        let file_index = args
+            .windows(3)
+            .position(|window| window == ["--ro-bind", "/dev/null", "/home/me/project/.env"])
+            .expect("non_readable file should be masked");
+        let dir_index = args
+            .windows(2)
+            .position(|window| window == ["--tmpfs", "/home/me/project/secrets"])
+            .expect("non_readable dir should be masked");
+        assert!(file_index > writable_index);
+        assert!(dir_index > writable_index);
+    }
+
+    #[test]
     fn bwrap_blocks_wsl_interop_by_default() {
         let args = build_bwrap_args(
             &["/home/me/project".to_string()],
+            &[],
             &[],
             SandboxPermissions::default(),
             Some("/home/me/project"),
@@ -1872,6 +1957,7 @@ mod tests {
     #[test]
     fn bwrap_blocks_wsl_interop_even_with_fs_write() {
         let args = build_bwrap_args(
+            &[],
             &[],
             &[],
             SandboxPermissions {
@@ -1904,6 +1990,7 @@ mod tests {
         let args = build_bwrap_args(
             &[],
             &[],
+            &[],
             SandboxPermissions::default(),
             None,
             false,
@@ -1922,7 +2009,15 @@ mod tests {
             ("PAGER".to_string(), String::new()),
             ("CARGO_TERM_COLOR".to_string(), "always".to_string()),
         ]);
-        let args = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, false, &env);
+        let args = build_bwrap_args(
+            &[],
+            &[],
+            &[],
+            SandboxPermissions::default(),
+            None,
+            false,
+            &env,
+        );
         assert!(
             args.windows(3)
                 .any(|window| window == ["--setenv", "PAGER", ""])
@@ -1943,7 +2038,15 @@ mod tests {
             ("WsLeNv".to_string(), "WSL_INTEROP/u".to_string()),
             ("PAGER".to_string(), String::new()),
         ]);
-        let args = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, false, &env);
+        let args = build_bwrap_args(
+            &[],
+            &[],
+            &[],
+            SandboxPermissions::default(),
+            None,
+            false,
+            &env,
+        );
 
         assert!(
             args.windows(2)
@@ -2014,7 +2117,15 @@ mod tests {
             ("PROCESSOR_ARCHITECTURE".to_string(), "AMD64".to_string()),
             ("NUMBER_OF_PROCESSORS".to_string(), "16".to_string()),
         ]);
-        let args = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, false, &env);
+        let args = build_bwrap_args(
+            &[],
+            &[],
+            &[],
+            SandboxPermissions::default(),
+            None,
+            false,
+            &env,
+        );
         assert!(!args.iter().any(|arg| arg == "--setenv"));
     }
 
@@ -2027,7 +2138,15 @@ mod tests {
             ("LANG".to_string(), "en_US.UTF-8".to_string()),
             ("CARGO_TERM_COLOR".to_string(), "always".to_string()),
         ]);
-        let args = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, false, &env);
+        let args = build_bwrap_args(
+            &[],
+            &[],
+            &[],
+            SandboxPermissions::default(),
+            None,
+            false,
+            &env,
+        );
         assert!(
             args.windows(3)
                 .any(|window| window == ["--setenv", "LANG", "en_US.UTF-8"])
@@ -2054,7 +2173,15 @@ mod tests {
             (String::new(), "value".to_string()),
             ("OK".to_string(), "value".to_string()),
         ]);
-        let args = build_bwrap_args(&[], &[], SandboxPermissions::default(), None, false, &env);
+        let args = build_bwrap_args(
+            &[],
+            &[],
+            &[],
+            SandboxPermissions::default(),
+            None,
+            false,
+            &env,
+        );
         assert!(
             args.windows(3)
                 .any(|window| window == ["--setenv", "OK", "value"])

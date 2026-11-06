@@ -84,6 +84,29 @@ pub fn sandbox_git_dirs(project: &Project, cx: &App) -> Vec<PathBuf> {
     git_dirs
 }
 
+/// The absolute paths of files and directories the user marked private via the
+/// `private_files` setting. The worktree scanner already computes `is_private`
+/// from that setting, so this reuses it rather than re-matching globs. Ignored
+/// entries are included because private files (`.env`, keys) are often
+/// gitignored.
+pub fn sandbox_non_readable_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let snapshot = worktree.snapshot();
+        for entry in snapshot.entries(true, 0) {
+            if entry.is_private {
+                paths.push(snapshot.absolutize(&entry.path));
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// What sandbox a thread applies to agent terminal commands, as one value the
 /// UI renders and enforcement builds from. "No sandbox" is its own variant
 /// rather than a maximally-permissive [`SandboxPolicy`] so that a wide-open but
@@ -139,6 +162,25 @@ impl ThreadSandbox {
             }
         }
     }
+
+    /// Attach the project's non_readable paths (files and directories the user
+    /// marked private via `private_files`) to a sandboxed layer. The caller
+    /// computes them via [`sandbox_non_readable_paths`]. A no-op for
+    /// `Unsandboxed`.
+    pub fn with_non_readable_paths(self, non_readable_paths: Vec<PathBuf>) -> ThreadSandbox {
+        match self {
+            ThreadSandbox::Unsandboxed => ThreadSandbox::Unsandboxed,
+            ThreadSandbox::Sandboxed(policy) => {
+                // Capture each location (pinning its inode / canonical path). A
+                // location that can't be captured is dropped — fail-closed.
+                let non_readable_paths = non_readable_paths
+                    .into_iter()
+                    .filter_map(|path| HostFilesystemLocation::capture(path).ok())
+                    .collect();
+                ThreadSandbox::Sandboxed(policy.with_non_readable_paths(non_readable_paths))
+            }
+        }
+    }
 }
 
 /// The sandbox the user's persistent settings establish for every thread, as a
@@ -161,6 +203,7 @@ pub fn settings_sandbox_policy(persistent: &SandboxPermissions) -> SandboxPolicy
     let fs = if persistent.allow_fs_write_all {
         SandboxFsPolicy::Unrestricted {
             protected_paths: Vec::new(),
+            non_readable_paths: Vec::new(),
         }
     } else {
         SandboxFsPolicy::Restricted {
@@ -176,6 +219,7 @@ pub fn settings_sandbox_policy(persistent: &SandboxPermissions) -> SandboxPolicy
                     .filter_map(acp_thread::granted_write_path_to_location_or_log),
             ),
             protected_paths: Vec::new(),
+            non_readable_paths: Vec::new(),
         }
     };
     let network = if persistent.allow_all_hosts {
@@ -439,6 +483,7 @@ impl ThreadSandboxGrants {
         let fs = if self.allow_fs_write_all {
             SandboxFsPolicy::Unrestricted {
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         } else {
             SandboxFsPolicy::Restricted {
@@ -454,6 +499,7 @@ impl ThreadSandboxGrants {
                         .filter_map(acp_thread::granted_write_path_to_location_or_log),
                 ),
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         };
         let network = if self.network_any_host {
@@ -699,6 +745,7 @@ mod tests {
                     .map(|p| HostFilesystemLocation::capture(p).expect("capture temp dir"))
                     .collect(),
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             },
             network: if hosts.is_empty() {
                 SandboxNetPolicy::Blocked
@@ -813,6 +860,7 @@ mod tests {
                     HostFilesystemLocation::capture(build_dir.path()).expect("capture temp dir")
                 ],
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         );
         assert_eq!(
@@ -829,6 +877,7 @@ mod tests {
             SandboxFsPolicy::Restricted {
                 writable_paths: Vec::new(),
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         );
         assert_eq!(empty.network, SandboxNetPolicy::Blocked);
@@ -841,6 +890,7 @@ mod tests {
             policy.fs,
             SandboxFsPolicy::Unrestricted {
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         );
         assert_eq!(policy.network, SandboxNetPolicy::Unrestricted);
@@ -865,6 +915,7 @@ mod tests {
                     HostFilesystemLocation::capture(log_dir.path()).expect("capture temp dir")
                 ],
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         );
         assert_eq!(
@@ -884,6 +935,7 @@ mod tests {
             policy.fs,
             SandboxFsPolicy::Unrestricted {
                 protected_paths: Vec::new(),
+                non_readable_paths: Vec::new(),
             }
         );
         assert_eq!(policy.network, SandboxNetPolicy::Unrestricted);

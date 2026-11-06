@@ -54,6 +54,9 @@ pub struct SandboxWrap {
     /// Additional paths that should remain readable but not writable, even when
     /// they fall under writable paths.
     pub protected_paths: Vec<PathBuf>,
+    /// Paths whose contents should be denied to reads (for example, files the
+    /// user marked private via `private_files`).
+    pub non_readable_paths: Vec<PathBuf>,
     /// Allow unrestricted filesystem writes except for protected paths (ignores
     /// ordinary writable paths).
     pub allow_fs_write: bool,
@@ -266,8 +269,16 @@ impl SandboxWrap {
             .iter()
             .filter_map(|path| sandbox::HostFilesystemLocation::capture(path).ok())
             .collect::<Vec<_>>();
+        let non_readable_paths = self
+            .non_readable_paths
+            .iter()
+            .filter_map(|path| sandbox::HostFilesystemLocation::capture(path).ok())
+            .collect::<Vec<_>>();
         let fs = if self.allow_fs_write {
-            sandbox::SandboxFsPolicy::Unrestricted { protected_paths }
+            sandbox::SandboxFsPolicy::Unrestricted {
+                protected_paths,
+                non_readable_paths,
+            }
         } else {
             // Project worktree paths are captured fresh; user-approved grants are
             // rebuilt via the verifying reopen (or captured when legacy bare
@@ -302,6 +313,7 @@ impl SandboxWrap {
             sandbox::SandboxFsPolicy::Restricted {
                 writable_paths,
                 protected_paths,
+                non_readable_paths,
             }
         };
         let network = match &self.network {

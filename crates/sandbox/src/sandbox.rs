@@ -94,14 +94,18 @@ pub enum SandboxFsPolicy {
     /// remain readable but not writable.
     Unrestricted {
         protected_paths: Vec<HostFilesystemLocation>,
+        /// Paths whose contents the command may not read.
+        non_readable_paths: Vec<HostFilesystemLocation>,
     },
-    /// Reads are allowed everywhere; writes are confined to these locations
-    /// (and the standard ephemeral locations the platform provides). Each is a
-    /// [`HostFilesystemLocation`] captured at validation time, never a bare path
-    /// the enforcement layer would re-resolve.
+    /// Reads are allowed everywhere except `non_readable_paths`; writes are
+    /// confined to these locations (and the standard ephemeral locations the
+    /// platform provides). Each is a [`HostFilesystemLocation`] captured at
+    /// validation time, never a bare path the enforcement layer would re-resolve.
     Restricted {
         writable_paths: Vec<HostFilesystemLocation>,
         protected_paths: Vec<HostFilesystemLocation>,
+        /// Paths whose contents the command may not read.
+        non_readable_paths: Vec<HostFilesystemLocation>,
     },
 }
 
@@ -176,11 +180,28 @@ impl SandboxPolicy {
         match &mut self.fs {
             SandboxFsPolicy::Unrestricted {
                 protected_paths: existing,
+                ..
             }
             | SandboxFsPolicy::Restricted {
                 protected_paths: existing,
                 ..
             } => *existing = protected_paths,
+        }
+        self
+    }
+
+    /// Replace the non_readable paths in the filesystem policy, keeping writable
+    /// paths and network policy unchanged.
+    pub fn with_non_readable_paths(mut self, non_readable_paths: Vec<HostFilesystemLocation>) -> Self {
+        match &mut self.fs {
+            SandboxFsPolicy::Unrestricted {
+                non_readable_paths: existing,
+                ..
+            }
+            | SandboxFsPolicy::Restricted {
+                non_readable_paths: existing,
+                ..
+            } => *existing = non_readable_paths,
         }
         self
     }
@@ -295,50 +316,63 @@ fn linux_location_is_equal_or_descendant(
 
 impl SandboxFsPolicy {
     /// Unrestricted access dominates; otherwise the writable subtrees union.
+    /// Protected and non_readable paths union in every case, since a denial in
+    /// either layer must survive the merge.
     pub fn merge(self, other: SandboxFsPolicy) -> SandboxFsPolicy {
         match (self, other) {
             (
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_a,
+                    non_readable_paths: non_readable_a,
                 },
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_b,
+                    non_readable_paths: non_readable_b,
                 },
             ) => SandboxFsPolicy::Unrestricted {
                 protected_paths: merge_locations(protected_a, protected_b),
+                non_readable_paths: merge_locations(non_readable_a, non_readable_b),
             },
             (
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_a,
+                    non_readable_paths: non_readable_a,
                 },
                 SandboxFsPolicy::Restricted {
                     protected_paths: protected_b,
+                    non_readable_paths: non_readable_b,
                     ..
                 },
             )
             | (
                 SandboxFsPolicy::Restricted {
                     protected_paths: protected_a,
+                    non_readable_paths: non_readable_a,
                     ..
                 },
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_b,
+                    non_readable_paths: non_readable_b,
                 },
             ) => SandboxFsPolicy::Unrestricted {
                 protected_paths: merge_locations(protected_a, protected_b),
+                non_readable_paths: merge_locations(non_readable_a, non_readable_b),
             },
             (
                 SandboxFsPolicy::Restricted {
                     writable_paths: writable_a,
                     protected_paths: protected_a,
+                    non_readable_paths: non_readable_a,
                 },
                 SandboxFsPolicy::Restricted {
                     writable_paths: writable_b,
                     protected_paths: protected_b,
+                    non_readable_paths: non_readable_b,
                 },
             ) => SandboxFsPolicy::Restricted {
                 writable_paths: merge_locations(writable_a, writable_b),
                 protected_paths: merge_locations(protected_a, protected_b),
+                non_readable_paths: merge_locations(non_readable_a, non_readable_b),
             },
         }
     }
@@ -459,6 +493,7 @@ struct FsSetup {
     allow_fs_write: bool,
     writable_paths: Vec<HostFilesystemLocation>,
     protected_paths: Vec<HostFilesystemLocation>,
+    non_readable_paths: Vec<HostFilesystemLocation>,
 }
 
 /// Resolved network plan derived from [`SandboxNetPolicy`]. For the restricted
@@ -518,14 +553,19 @@ impl Sandbox {
     /// availability is checked separately via [`Sandbox::can_create`].
     pub fn new(policy: SandboxPolicy) -> Result<Self, SandboxError> {
         let fs = match policy.fs {
-            SandboxFsPolicy::Unrestricted { protected_paths } => FsSetup {
+            SandboxFsPolicy::Unrestricted {
+                protected_paths,
+                non_readable_paths,
+            } => FsSetup {
                 allow_fs_write: true,
                 writable_paths: Vec::new(),
                 protected_paths,
+                non_readable_paths,
             },
             SandboxFsPolicy::Restricted {
                 writable_paths,
                 protected_paths,
+                non_readable_paths,
             } => {
                 validate_writable_paths_do_not_overlap_protected_paths(
                     &writable_paths,
@@ -535,6 +575,7 @@ impl Sandbox {
                     allow_fs_write: false,
                     writable_paths,
                     protected_paths,
+                    non_readable_paths,
                 }
             }
         };
@@ -710,6 +751,13 @@ impl Sandbox {
         self.fs.protected_paths.clone()
     }
 
+    /// Return the non_readable paths for the enforcement layer. These are denied
+    /// read access regardless of the write policy.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn non_readable_paths(&self) -> Vec<HostFilesystemLocation> {
+        self.fs.non_readable_paths.clone()
+    }
+
     #[cfg(target_os = "linux")]
     fn wrap_linux(&mut self, command: &CommandAndArgs) -> Result<WrappedCommand, SandboxError> {
         let mut env = command.env.clone();
@@ -762,6 +810,13 @@ impl Sandbox {
             .map(|location| location.linux_canonical_path().to_path_buf())
             .collect();
         let protected_paths: Vec<&Path> = protected_owned.iter().map(PathBuf::as_path).collect();
+        let non_readable_locations = self.non_readable_paths();
+        let non_readable_owned: Vec<PathBuf> = non_readable_locations
+            .iter()
+            .map(|location| location.linux_canonical_path().to_path_buf())
+            .collect();
+        let non_readable_paths: Vec<&Path> =
+            non_readable_owned.iter().map(PathBuf::as_path).collect();
 
         // Stand up the host endpoint that sends the captured fds to the
         // in-sandbox validator, when this run has writable binds to verify. It's
@@ -799,6 +854,7 @@ impl Sandbox {
             permissions,
             &writable,
             &protected_paths,
+            &non_readable_paths,
             command.cwd.as_deref(),
             &command.program,
             &command.args,
@@ -847,6 +903,11 @@ impl Sandbox {
             .iter()
             .map(HostFilesystemLocation::macos_canonical_path)
             .collect();
+        let non_readable_locations = self.non_readable_paths();
+        let non_readable: Vec<&Path> = non_readable_locations
+            .iter()
+            .map(HostFilesystemLocation::macos_canonical_path)
+            .collect();
 
         // SSH-agent socket handling (commit signing) is deferred, so no unix
         // sockets are allowed for now.
@@ -855,6 +916,7 @@ impl Sandbox {
             &command.args,
             &writable,
             &protected,
+            &non_readable,
             &[],
             permissions,
         )
@@ -894,11 +956,21 @@ impl Sandbox {
             .iter()
             .map(|location| location.windows_requested_path().to_path_buf())
             .collect();
+        let non_readable_paths: Vec<(PathBuf, bool)> = self
+            .non_readable_paths()
+            .iter()
+            .map(|location| {
+                let path = location.windows_requested_path().to_path_buf();
+                let is_dir = path.is_dir();
+                (path, is_dir)
+            })
+            .collect();
         let (program, args) = windows_wsl::wrap_invocation(
             command.program.clone(),
             command.args.clone(),
             writable_paths,
             protected_paths,
+            non_readable_paths,
             permissions,
             command.cwd.clone(),
             command.env.clone(),
@@ -1153,6 +1225,7 @@ mod tests {
                 fs: SandboxFsPolicy::Restricted {
                     writable_paths: vec![writable_path],
                     protected_paths: vec![protected_git.clone()],
+                    non_readable_paths: Vec::new(),
                 },
                 network: SandboxNetPolicy::Blocked,
             });
@@ -1185,6 +1258,7 @@ mod tests {
             fs: SandboxFsPolicy::Restricted {
                 writable_paths: vec![writable_displayed_inside_git],
                 protected_paths: vec![protected_git],
+                non_readable_paths: Vec::new(),
             },
             network: SandboxNetPolicy::Blocked,
         })
@@ -1206,36 +1280,44 @@ mod tests {
         let a = SandboxFsPolicy::Restricted {
             writable_paths: vec![location(&dir_a), location(&dir_b)],
             protected_paths: vec![location(&dir_c)],
+            non_readable_paths: vec![location(&dir_a)],
         };
         let b = SandboxFsPolicy::Restricted {
             writable_paths: vec![location(&dir_b), location(&dir_c)],
             protected_paths: vec![location(&dir_c), location(&dir_d)],
+            non_readable_paths: vec![location(&dir_b)],
         };
         assert_eq!(
             a.clone().merge(b),
             SandboxFsPolicy::Restricted {
                 writable_paths: vec![location(&dir_a), location(&dir_b), location(&dir_c)],
                 protected_paths: vec![location(&dir_c), location(&dir_d)],
+                non_readable_paths: vec![location(&dir_a), location(&dir_b)],
             }
         );
         assert_eq!(
             a.merge(SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_a)],
+                non_readable_paths: vec![location(&dir_c)],
             }),
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_c), location(&dir_a)],
+                non_readable_paths: vec![location(&dir_a), location(&dir_c)],
             }
         );
         assert_eq!(
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_d)],
+                non_readable_paths: vec![location(&dir_d)],
             }
             .merge(SandboxFsPolicy::Restricted {
                 writable_paths: vec![location(&dir_a)],
                 protected_paths: vec![location(&dir_c)],
+                non_readable_paths: vec![location(&dir_c)],
             }),
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_d), location(&dir_c)],
+                non_readable_paths: vec![location(&dir_d), location(&dir_c)],
             }
         );
     }
